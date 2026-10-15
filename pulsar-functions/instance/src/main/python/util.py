@@ -1,0 +1,192 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+#
+
+# -*- encoding: utf-8 -*-
+
+"""util.py: Some misc utility functions
+"""
+import os
+import inspect
+import sys
+import importlib
+import configparser
+
+from threading import Timer
+import pulsar
+from pulsar.functions import serde
+
+import log
+
+Log = log.Log
+PULSAR_API_ROOT = 'pulsar'
+PULSAR_FUNCTIONS_API_ROOT = 'functions'
+
+def import_class(from_path, full_class_name):
+  from_path = str(from_path)
+  full_class_name = str(full_class_name)
+  try:
+    return import_class_from_path(from_path, full_class_name)
+  except Exception as e:
+    our_dir = os.path.dirname(os.path.abspath(inspect.getfile(inspect.currentframe())))
+    api_dir = os.path.join(our_dir, PULSAR_API_ROOT, PULSAR_FUNCTIONS_API_ROOT)
+    try:
+      return import_class_from_path(api_dir, full_class_name)
+    except Exception as e:
+      Log.info("Failed to import class %s from path %s" % (full_class_name, from_path))
+      Log.info(e, exc_info=True)
+      return None
+
+def import_class_from_path(from_path, full_class_name):
+  Log.debug('Trying to import %s from path %s' % (full_class_name, from_path))
+  split = full_class_name.split('.')
+  classname_path = '.'.join(split[:-1])
+  class_name = full_class_name.split('.')[-1]
+  if from_path not in sys.path:
+    Log.debug("Add a new dependency to the path: %s" % from_path)
+    sys.path.insert(0, from_path)
+  if not classname_path:
+    mod = importlib.import_module(class_name)
+    return mod
+  else:
+    # Serde modules is being used in unqualified form instead of using
+    # the full name `pulsar.functions.serde`, so we have to make sure
+    # it gets resolved correctly.
+    if classname_path == 'serde':
+        mod = serde
+    else:
+        mod = importlib.import_module(classname_path)
+    retval = getattr(mod, class_name)
+    return retval
+
+def getFullyQualifiedFunctionName(tenant, namespace, name):
+  return "%s/%s/%s" % (tenant, namespace, name)
+
+def getFullyQualifiedInstanceId(tenant, namespace, name, instance_id):
+    return "%s/%s/%s:%s" % (tenant, namespace, name, instance_id)
+
+def get_properties(fullyQualifiedName, instanceId):
+    return {"application": "pulsar-function", "id": str(fullyQualifiedName), "instance_id": str(instanceId)}
+
+# Defaults applied when a function carries no producer configuration. These deliberately mirror the
+# base defaults in the Java runtime's ProducerBuilderFactory (blockIfQueueFull(true),
+# enableBatching(true), batchingMaxPublishDelay(10ms)) so that a function behaves the same on either
+# runtime when nothing is configured.
+DEFAULT_BATCHING_ENABLED = True
+DEFAULT_BATCHING_MAX_PUBLISH_DELAY_MS = 10
+
+def batching_type_from_batch_builder(batch_builder):
+  """Translate a batchBuilder name from the function's ProducerSpec into a pulsar.BatchingType.
+
+  Anything other than "KEY_BASED" maps to the default batcher, matching the Java runtime.
+  """
+  if batch_builder == "KEY_BASED":
+    return pulsar.BatchingType.KeyBased
+  return pulsar.BatchingType.Default
+
+def producer_config_from_spec(producer_spec):
+  """Translate a ProducerSpec protobuf into keyword arguments for Client.create_producer().
+
+  Returns the batching and pending-queue settings only; the caller owns everything else (topic,
+  schema, compression, crypto, properties, ...). Fields that are unset or non-positive in the spec
+  are left out of the result so that the client's own defaults apply, which is the same rule the
+  Java runtime follows in ProducerBuilderFactory.
+
+  Passing None (no producerSpec on the sink) yields the backwards-compatible defaults: batching
+  enabled with a 10ms maximum publish delay. This mirrors BatchingUtils.convertFromSpec(null).
+  """
+  config = {
+    "batching_enabled": DEFAULT_BATCHING_ENABLED,
+    "batching_max_publish_delay_ms": DEFAULT_BATCHING_MAX_PUBLISH_DELAY_MS,
+  }
+
+  if producer_spec is None:
+    return config
+
+  # batchBuilder lives on the ProducerSpec itself and, since PIP-401, also on the nested
+  # BatchingSpec. The Java runtime applies the ProducerSpec one first and lets the BatchingSpec one
+  # override it, so do the same here.
+  if producer_spec.batchBuilder:
+    config["batching_type"] = batching_type_from_batch_builder(producer_spec.batchBuilder)
+
+  if producer_spec.maxPendingMessages > 0:
+    config["max_pending_messages"] = producer_spec.maxPendingMessages
+  if producer_spec.maxPendingMessagesAcrossPartitions > 0:
+    config["max_pending_messages_across_partitions"] = producer_spec.maxPendingMessagesAcrossPartitions
+
+  if not producer_spec.HasField("batchingSpec"):
+    return config
+
+  batching_spec = producer_spec.batchingSpec
+  config["batching_enabled"] = batching_spec.enabled
+  if batching_spec.batchingMaxPublishDelayMs > 0:
+    config["batching_max_publish_delay_ms"] = batching_spec.batchingMaxPublishDelayMs
+  if batching_spec.batchingMaxMessages > 0:
+    config["batching_max_messages"] = batching_spec.batchingMaxMessages
+  if batching_spec.batchingMaxBytes > 0:
+    config["batching_max_allowed_size_in_bytes"] = batching_spec.batchingMaxBytes
+  if batching_spec.batchBuilder:
+    config["batching_type"] = batching_type_from_batch_builder(batching_spec.batchBuilder)
+
+  return config
+
+def producer_config_from_function_details(function_details):
+  """Return the producer keyword arguments configured on a function's sink.
+
+  Safe to call for any function: sinks without a producerSpec fall back to the defaults.
+  """
+  if function_details is None or not function_details.sink.HasField("producerSpec"):
+    return producer_config_from_spec(None)
+  return producer_config_from_spec(function_details.sink.producerSpec)
+
+def read_config(config_file):
+    """
+    The content of the configuration file is styled as follows:
+
+    [DEFAULT]
+    parameter1 = value1
+    parameter2 = value2
+    parameter3 = value3
+    ...
+    """
+    if config_file == "":
+        return None
+
+    cfg = configparser.ConfigParser()
+    cfg.read(config_file)
+    return cfg
+
+class FixedTimer():
+
+    def __init__(self, t, hFunction, name="timer-thread"):
+        self.t = t
+        self.hFunction = hFunction
+        self.thread = Timer(self.t, self.handle_function)
+        self.thread.name = name
+        self.thread.daemon = True
+
+    def handle_function(self):
+        self.hFunction()
+        self.thread = Timer(self.t, self.handle_function)
+        self.thread.start()
+
+    def start(self):
+        self.thread.start()
+
+    def cancel(self):
+        self.thread.cancel()
